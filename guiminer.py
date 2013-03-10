@@ -10,11 +10,12 @@ Currently supports:
 Copyright 2011-2012 Chris MacLeod
 This program is released under the GNU GPL. See LICENSE.txt for details.
 """
-import sys, os, subprocess, errno, re, threading, logging, time, httplib, urllib
+import sys, os, subprocess, errno, re, threading, logging, time, httplib, urllib, distutils.dir_util
 print sys.path
 import wx
 import json
 import collections
+import pyopencl
 
 try:
     import win32api, win32con, win32process
@@ -25,7 +26,9 @@ from wx.lib.agw import flatnotebook as fnb
 from wx.lib.agw import hyperlink
 from wx.lib.newevent import NewEvent
 
-__version__ = '2012-11-18'
+__version__ = 'v0.01'
+
+STARTUP_PATH = os.getcwd()
 
 def get_module_path():
     """Return the folder containing this script (or its .exe)."""
@@ -55,7 +58,7 @@ LANGUAGES = {
 }
 LANGUAGES_REVERSE = dict((v, k) for (k, v) in LANGUAGES.items())
 
-DONATION_ADDRESS = "1MDDh2h4cAZDafgc94mr9q95dhRYcJbNQo"
+DONATION_ADDRESS = "LiK1rotC2tNYNRbRfW2xsKLYJvKhQ3PwTN"
 locale = None
 language = None
 def update_language(new_language):
@@ -92,7 +95,7 @@ ABOUT_TEXT = _(
 """GUIMiner
 
 Version: %(version)s
-
+Scrypt mod by TacoTime
 GUI by Chris 'Kiv' MacLeod
 Original poclbm miner by m0mchil
 Original rpcminer by puddinpop
@@ -105,7 +108,7 @@ by donating to:
 
 %(address)s
 
-Even a single Bitcoin is appreciated and helps motivate
+Even a single Litecoin is appreciated and helps motivate
 further work on this software.
 """)
 
@@ -114,8 +117,8 @@ STR_NOT_STARTED = _("Not started")
 STR_STARTING = _("Starting...")
 STR_STOPPED = _("Stopped")
 STR_PAUSED = _("Paused")
-STR_START_MINING = _("Start mining!")
-STR_STOP_MINING = _("Stop mining")
+STR_START_MINING = _("Start")
+STR_STOP_MINING = _("Stop")
 STR_REFRESH_BALANCE = _("Refresh balance")
 STR_CONNECTION_ERROR = _("Connection error")
 STR_USERNAME = _("Username:")
@@ -147,8 +150,13 @@ BTN_STYLE = wx.ALIGN_CENTER_HORIZONTAL | wx.ALL
 # Events sent from the worker threads
 (UpdateHashRateEvent, EVT_UPDATE_HASHRATE) = NewEvent()
 (UpdateAcceptedEvent, EVT_UPDATE_ACCEPTED) = NewEvent()
+(ReaperAttributeUpdate, EVT_REAPER_ATTRIBUTE_UPDATE) = NewEvent()
+(UpdateAcceptedReaperEvent, EVT_UPDATE_REAPER_ACCEPTED) = NewEvent()
 (UpdateSoloCheckEvent, EVT_UPDATE_SOLOCHECK) = NewEvent()
 (UpdateStatusEvent, EVT_UPDATE_STATUS) = NewEvent()
+
+# Used in class CgListenerThread(MinerListenerThread) and ReaperListenerThread(MinerListenerThread)
+non_decimal = re.compile(r'[^\d.]+')
 
 # Utility functions
 def merge_whitespace(s):
@@ -162,7 +170,6 @@ def get_opencl_devices():
     Raises ImportError if OpenCL is not found.
     Raises IOError if no OpenCL devices are found.
     """
-    import pyopencl
     device_strings = []
     platforms = pyopencl.get_platforms() #@UndefinedVariable
     for i, platform in enumerate(platforms):
@@ -207,6 +214,8 @@ def format_khash(rate):
         return _("%.1f Mhash/s") % (rate / 1000.)
     elif rate == 0:
         return _("Connecting...")
+    elif rate == -1.0:
+        return _("Proxy connected")
     else:
         return _("%d khash/s") % rate
 
@@ -441,7 +450,7 @@ class GUIMinerTaskBarIcon(wx.TaskBarIcon):
                 miner.pause()
             else:
                 miner.resume()
-
+# A stupid but necessary function required by the retarded use of per line feeding by use of anonymous function lambda above
 
 class MinerListenerThread(threading.Thread):
     LINES = [
@@ -450,9 +459,9 @@ class MinerListenerThread(threading.Thread):
         (r"accepted|\"result\":\s*true",
             lambda _: UpdateAcceptedEvent(accepted=True)),
         (r"invalid|stale|rejected", lambda _:
-            UpdateAcceptedEvent(accepted=False)),
-        (r"(\d+)\s*khash/s", lambda match:
-            UpdateHashRateEvent(rate=int(match.group(1)))),
+            UpdateAcceptedEvent(accepted=False)),     
+        (r"(\d+)\s*Kh/s", lambda match:
+            UpdateHashRateEvent(rate=float(match.group(1)))),
         (r"(\d+\.\d+)\s*MH/s", lambda match:
             UpdateHashRateEvent(rate=float(match.group(1)) * 1000)),
         (r"(\d+\.\d+)\s*Mhash/s", lambda match:
@@ -461,7 +470,7 @@ class MinerListenerThread(threading.Thread):
             UpdateHashRateEvent(rate=int(match.group(1)) * 1000)),
         (r"checking (\d+)", lambda _:
             UpdateSoloCheckEvent()),
-    ]
+    ] 
 
     def __init__(self, parent, miner):
         threading.Thread.__init__(self)
@@ -469,20 +478,22 @@ class MinerListenerThread(threading.Thread):
         self.parent = parent
         self.parent_name = parent.name
         self.miner = miner
-
+        
     def run(self):
         logger.info(_('Listener for "%s" started') % self.parent_name)
         while not self.shutdown_event.is_set():
             line = self.miner.stdout.readline().strip()
             #logger.debug("Line: %s", line)
             if not line: continue
+           
             for s, event_func in self.LINES: # Use self to allow subclassing
                 match = re.search(s, line, flags=re.I)
                 if match is not None:
                     event = event_func(match)
                     if event is not None:
                         wx.PostEvent(self.parent, event)
-                    break
+                    break     
+           
             else:
                 # Possible error or new message, just pipe it through
                 event = UpdateStatusEvent(text=line)
@@ -507,16 +518,42 @@ class PhoenixListenerThread(MinerListenerThread):
     
 class CgListenerThread(MinerListenerThread):
     LINES = [
-        (r"Accepted .* GPU \d+ thread \d+",
+        (r" Accepted .*",
             lambda _: UpdateAcceptedEvent(accepted=True)),
-        (r"Rejected .* GPU \d+ thread \d+",
+        #(r"A:*\d+",
+        #    lambda _: UpdateAcceptedEvent(accepted=False)),
+        (r" Rejected .*",
             lambda _: UpdateAcceptedEvent(accepted=False)),
-        (r"\(\d+s\):(\d+)\.?(\d*) .* Mh/s", lambda match:
-            UpdateHashRateEvent(rate=float(match.group(1) + '.' + match.group(2)) * 1000)),
+        #(r"R:*\d+",
+        #    lambda _: UpdateAcceptedEvent(accepted=False)),
+        #(r"Q:*\d+",
+        #    lambda _: UpdateAcceptedEvent(accepted=False)),
+        #(r"HW:*\d+",
+        #    lambda _: UpdateAcceptedEvent(accepted=False)),
+        #(r"\(\d+s\):(\d+)\.?(\d*) .* Kh/s", lambda match:
+        #    UpdateHashRateEvent(rate=float(match.group(1) + '.' + match.group(2)) * 1000)),
+        (r"\(*avg\):.*Kh", lambda match:
+            UpdateHashRateEvent(rate=float(non_decimal.sub('', match.group(0))))),
         (r"^GPU\s*\d+",
             lambda _: None), # Just ignore lines like these
     ]
-    
+
+# Below is kind of an ugly hack for updating reaper shares, but it works - TacoTime
+class ReaperListenerThread(MinerListenerThread):
+    LINES = [
+        (r"GPU \d+.*", lambda match:
+            ReaperAttributeUpdate(clstring=match.group(0)))
+    ]
+        
+class ProxyListenerThread(MinerListenerThread):
+    LINES = [
+        (r".* accepted, .*",
+            lambda _: UpdateAcceptedEvent(accepted=True)),
+        (r".* REJECTED:.*",
+            lambda _: UpdateAcceptedEvent(accepted=False)),
+        (r".*LISTENING.*", lambda match:
+            UpdateHashRateEvent(rate = -1.0)),
+    ]
 
 class MinerTab(wx.Panel):
     """A tab in the GUI representing a miner instance.
@@ -528,11 +565,12 @@ class MinerTab(wx.Panel):
     - Post updates to the GUI's statusbar & summary panel; the format depends
       whether the backend is working solo or in a pool.
     """
-    def __init__(self, parent, id, devices, servers, defaults, statusbar, data):
+    def __init__(self, parent, id, devices, servers, defaults, gpusettings_data, statusbar, data):
         wx.Panel.__init__(self, parent, id)
         self.parent = parent
         self.servers = servers
         self.defaults = defaults
+        self.gpusettings_data = gpusettings_data
         self.statusbar = statusbar
         self.is_mining = False
         self.is_paused = False
@@ -553,6 +591,10 @@ class MinerTab(wx.Panel):
         self.server = wx.ComboBox(self, -1,
                                   choices=[s['name'] for s in servers],
                                   style=wx.CB_READONLY)
+        self.gpusettings_lbl = wx.StaticText(self, -1, _("GPU Defaults:"))
+        self.gpusettings = wx.ComboBox(self, -1,
+                                  choices=[s['name'] for s in gpusettings_data],
+                                  style=wx.CB_READONLY)
         self.website_lbl = wx.StaticText(self, -1, _("Website:"))
         self.website = hyperlink.HyperLinkCtrl(self, -1, "")
         self.external_lbl = wx.StaticText(self, -1, _("Ext. Path:"))
@@ -567,12 +609,29 @@ class MinerTab(wx.Panel):
         self.txt_pass = wx.TextCtrl(self, -1, "", style=wx.TE_PASSWORD)
         self.device_lbl = wx.StaticText(self, -1, _("Device:"))
         self.device_listbox = wx.ComboBox(self, -1, choices=devices or [_("No OpenCL devices")], style=wx.CB_READONLY)
+        self.minercgminer_lbl = wx.StaticText(self, -1, _("Miner: cgminer"))
+        self.minerreaper_lbl = wx.StaticText(self, -1, _("Miner: reaper"))
+        self.proxy_lbl = wx.StaticText(self, -1, _("Stratum proxy"))
+        self.thrcon_lbl = wx.StaticText(self, -1, _("Thread concurrency:"))
+        self.txt_thrcon = wx.TextCtrl(self, -1, "")
+        self.worksize_lbl = wx.StaticText(self, -1, _("Worksize:"))
+        self.txt_worksize = wx.TextCtrl(self, -1, "")
+        self.vectors_lbl = wx.StaticText(self, -1, _("Vectors:"))
+        self.txt_vectors = wx.TextCtrl(self, -1, "")
+        self.intensity_lbl = wx.StaticText(self, -1, _("Intensity:"))
+        self.txt_intensity = wx.TextCtrl(self, -1, "")
+        self.gputhreads_lbl = wx.StaticText(self, -1, _("GPU threads:"))
+        self.txt_gputhreads = wx.TextCtrl(self, -1, "")
         self.flags_lbl = wx.StaticText(self, -1, _("Extra flags:"))
         self.txt_flags = wx.TextCtrl(self, -1, "")
         self.extra_info = wx.StaticText(self, -1, "")
         self.affinity_lbl = wx.StaticText(self, -1, _("CPU Affinity:"))
-        self.affinity_chks = [wx.CheckBox(self, label='%d ' % i)
-                              for i in range(self.num_processors)]
+        #self.affinity_chks = [wx.CheckBox(self, label='%d ' % i)
+        #                      for i in range(self.num_processors)]
+        self.stratum_lbl = wx.StaticText(self, -1, _("Use stratum:"))
+        self.txt_stratum = wx.ComboBox(self, -1,
+                                  choices=['Yes','No'],
+                                  style=wx.CB_READONLY)
         self.balance_lbl = wx.StaticText(self, -1, _("Balance:"))
         self.balance_amt = wx.StaticText(self, -1, "0")
         self.balance_refresh = wx.Button(self, -1, STR_REFRESH_BALANCE)
@@ -581,20 +640,20 @@ class MinerTab(wx.Panel):
         self.balance_cooldown_seconds = 0
         self.balance_auth_token = ""
 
-        self.labels = [self.server_lbl, self.website_lbl,
+        self.labels = [self.minercgminer_lbl, self.minerreaper_lbl, self.proxy_lbl, self.server_lbl, self.website_lbl,
                       self.host_lbl, self.port_lbl,
                       self.user_lbl, self.pass_lbl,
 
-                      self.device_lbl, self.flags_lbl,
+                      self.device_lbl, self.thrcon_lbl, self.vectors_lbl, self.intensity_lbl, self.gputhreads_lbl, self.worksize_lbl, self.stratum_lbl, self.flags_lbl, 
                       self.balance_lbl]
         self.txts = [self.txt_host, self.txt_port,
                      self.txt_username, self.txt_pass,
-                     self.txt_flags]
+                     self.txt_thrcon, self.txt_worksize, self.txt_vectors, self.txt_intensity, self.txt_gputhreads, self.txt_stratum, self.txt_flags]
         self.all_widgets = [self.server, self.website,
                             self.device_listbox,
                             self.balance_amt,
                             self.balance_refresh,
-                            self.withdraw] + self.labels + self.txts + self.affinity_chks
+                            self.withdraw] + self.labels + self.txts
         self.hidden_widgets = [self.extra_info,
                                self.txt_external,
                                self.external_lbl]
@@ -612,13 +671,16 @@ class MinerTab(wx.Panel):
 
         self.start.Bind(wx.EVT_BUTTON, self.toggle_mining)
         self.server.Bind(wx.EVT_COMBOBOX, self.on_select_server)
+        self.gpusettings.Bind(wx.EVT_COMBOBOX, self.on_select_gpusettings)
         self.balance_refresh_timer.Bind(wx.EVT_TIMER, self.on_balance_cooldown_tick)
         self.balance_refresh.Bind(wx.EVT_BUTTON, self.on_balance_refresh)
         self.withdraw.Bind(wx.EVT_BUTTON, self.on_withdraw)
-        for chk in self.affinity_chks:
-            chk.Bind(wx.EVT_CHECKBOX, self.on_affinity_check)
+        #for chk in self.affinity_chks:
+        #    chk.Bind(wx.EVT_CHECKBOX, self.on_affinity_check)
         self.Bind(EVT_UPDATE_HASHRATE, lambda event: self.update_khash(event.rate))
         self.Bind(EVT_UPDATE_ACCEPTED, lambda event: self.update_shares(event.accepted))
+        self.Bind(EVT_REAPER_ATTRIBUTE_UPDATE, lambda event: self.update_attributes_reaper(event.clstring))
+        self.Bind(EVT_UPDATE_REAPER_ACCEPTED, lambda event: self.update_shares_reaper(event.quantity, event.accepted))
         self.Bind(EVT_UPDATE_STATUS, lambda event: self.update_status(event.text))
         self.Bind(EVT_UPDATE_SOLOCHECK, lambda event: self.update_solo())
         self.update_statusbar()
@@ -635,6 +697,11 @@ class MinerTab(wx.Panel):
     def server_config(self):
         hostname = self.txt_host.GetValue()
         return self.get_server_by_field(hostname, 'host')
+        
+    @property
+    def gpusettings_config(self):
+        profilename = self.gpusettings_data.GetValue()
+        return self.get_gpusettings_by_field(profilename, 'name')
 
     @property
     def is_solo(self):
@@ -698,7 +765,7 @@ class MinerTab(wx.Panel):
         """Set the affinity mask to the selected value."""
         self.affinity_mask = 0
         for i in range(self.num_processors):
-            is_checked = self.affinity_chks[i].GetValue()
+            # is_checked = self.affinity_chks[i].GetValue()
             self.affinity_mask += (is_checked << i)
         if self.is_mining:
             try:
@@ -727,6 +794,12 @@ class MinerTab(wx.Panel):
                     password=self.txt_pass.GetValue(),
                     device=self.device_listbox.GetSelection(),
                     flags=self.txt_flags.GetValue(),
+                    thrcon=self.txt_thrcon.GetValue(),
+                    worksize=self.txt_worksize.GetValue(),
+                    vectors=self.txt_vectors.GetValue(),
+                    intensity=self.txt_intensity.GetValue(),
+                    gputhreads=self.txt_gputhreads.GetValue(),
+                    stratum=self.txt_stratum.GetValue(),
                     autostart=self.autostart,
                     affinity_mask=self.affinity_mask,
                     balance_auth_token=self.balance_auth_token,
@@ -741,11 +814,18 @@ class MinerTab(wx.Panel):
 
         # Backwards compatibility: hostname key used to be called server.
         # We only save out hostname now but accept server from old INI files.
-        hostname = (data.get('hostname') or
-                    data.get('server') or
-                    default_server_config['host'])
+        hostname = (data.get('hostname') or _('')) # Hack by tacotime, don't give it any host, the use can enter it
+        external_path_ref = (data.get('external_path') or _('CGMINER'))
+        
         self.txt_host.SetValue(hostname)
-
+        self.txt_external.SetValue(external_path_ref)
+        self.txt_thrcon.SetValue(data.get('thrcon') or _(''))
+        self.txt_worksize.SetValue(data.get('worksize') or _(''))
+        self.txt_vectors.SetValue(data.get('vectors') or _(''))
+        self.txt_intensity.SetValue(data.get('intensity') or _(''))
+        self.txt_gputhreads.SetValue(data.get('gputhreads') or _(''))
+        self.txt_stratum.SetValue(data.get('stratum') or _('Yes'))
+        
         self.server.SetStringSelection(self.server_config.get('name', "Other"))
 
         self.txt_username.SetValue(
@@ -758,21 +838,21 @@ class MinerTab(wx.Panel):
 
         self.txt_port.SetValue(str(
             data.get('port') or
-            self.server_config.get('port', 8332)))
+            self.server_config.get('port', 3333)))
 
         self.txt_flags.SetValue(data.get('flags', ''))
         self.autostart = data.get('autostart', False)
         self.affinity_mask = data.get('affinity_mask', 1)
         for i in range(self.num_processors):
-            self.affinity_chks[i].SetValue((self.affinity_mask >> i) & 1)
-
-        self.txt_external.SetValue(data.get('external_path', ''))
+            # self.affinity_chks[i].SetValue((self.affinity_mask >> i) & 1)
+            pass
 
         # Handle case where they removed devices since last run.
         device_index = data.get('device', None)
         if device_index is not None and device_index < self.device_listbox.GetCount():
             self.device_listbox.SetSelection(device_index)
 
+        # self.change_gpusettings(self.gpusettings_config)
         self.change_server(self.server_config)
 
         self.balance_auth_token = data.get('balance_auth_token', '')
@@ -805,18 +885,32 @@ class MinerTab(wx.Panel):
             text = STR_STOPPED
         elif self.is_possible_error:
             text = _("Connection problems")
+        elif (self.last_rate == -1.0):
+            text = _("Proxy connected")
         else:
             text = format_khash(self.last_rate)
+            
         self.summary_status.SetLabel(text)
+        
+        # Original
+        # self.summary_shares_accepted.SetLabel("%d (%d)" % 
+        #     (self.accepted_shares, len(self.accepted_times)))
+        # New - Don't care about accepted_times since reaper doesn't have them - TacoTime
+        self.summary_shares_accepted.SetLabel("%d" % 
+            (self.accepted_shares))
 
-        self.summary_shares_accepted.SetLabel("%d (%d)" % 
-            (self.accepted_shares, len(self.accepted_times)))
-
+        # Original
+        # if self.is_solo:
+        #    self.summary_shares_invalid.SetLabel("-")
+        # else:
+        #     self.summary_shares_invalid.SetLabel("%d (%d)" % 
+        #         (self.invalid_shares, len(self.invalid_times)))
+        # New - Don't care about invalid_times since reaper doesn't have them - TacoTime
         if self.is_solo:
             self.summary_shares_invalid.SetLabel("-")
         else:
-            self.summary_shares_invalid.SetLabel("%d (%d)" % 
-                (self.invalid_shares, len(self.invalid_times)))
+            self.summary_shares_invalid.SetLabel("%d" % 
+                (self.invalid_shares))
 
         self.summary_start.SetLabel(self.get_start_stop_state())
         self.summary_autostart.SetValue(self.autostart)
@@ -932,7 +1026,95 @@ class MinerTab(wx.Panel):
 
     def configure_subprocess_cgminer(self):
         """Set up the command line for cgminer."""
-        path = self.external_path
+
+        # Set the path for cgminer, should be ./cgminer/cgminer.exe
+        # Not set up for unix, modify this to /cgminer/cgminer for unix
+        path = STARTUP_PATH + "\\cgminer\\cgminer.exe"
+        
+        #if path.endswith('.py'):
+        #    path = "python " + path
+        
+        if self.txt_stratum.GetValue() == "Yes":
+            http_header = "stratum+tcp://"
+        else:
+            http_header = "http://"
+
+        # Command line arguments for cgminer here:
+        # -u <username>
+        # -p <password>
+        # -o <http://server.ip:port>
+        # -d <device appear in pyopencl>
+        # -l <log message period in second>
+        # -T <disable curses interface and output to console (stdout)>
+        cmd = "%s --scrypt -u %s -p %s -o %s%s:%s -d %s --thread-concurrency %s -w %s -v %s -I %s -g %s -l 5 -T %s" % (
+            path,
+            self.txt_username.GetValue(),
+            self.txt_pass.GetValue(),
+            http_header,
+            self.host_without_http_prefix,
+            self.txt_port.GetValue(),
+            self.device_index,
+            self.txt_thrcon.GetValue(),
+            self.txt_worksize.GetValue(),
+            self.txt_vectors.GetValue(),
+            self.txt_intensity.GetValue(),
+            self.txt_gputhreads.GetValue(),
+            self.txt_flags.GetValue())
+        return cmd, os.path.dirname(path)
+
+    def write_reaper_configs(self, reaperdir):
+        # reaper.conf
+        f = open(reaperdir + "\\reaper.conf", 'w')
+        f.write("kernel reaper.cl\n")
+        f.write("save_binaries yes\n")
+        f.write("enable_graceful_shutdown no\n")
+        f.write("long_polling yes\n")
+        f.write("platform " + str(self.platform_index) + "\n")
+        f.write("device " + str(self.device_index) + "\n\n")
+        f.write("mine litecoin\n")
+        f.close()
+        
+        # litecoin.conf
+        f = open(reaperdir + "\\litecoin.conf", 'w')
+        f.write("host " + self.host_without_http_prefix + "\n")
+        f.write("port " + self.txt_port.GetValue() + "\n")
+        f.write("user " + self.txt_username.GetValue() + "\n")
+        f.write("pass " + self.txt_pass.GetValue() + "\n\n")
+        f.write("protocol litecoin\n\n")
+        f.write("gpu_thread_concurrency " + self.txt_thrcon.GetValue() + "\n")
+        f.write("worksize " + self.txt_worksize.GetValue() + "\n")
+        f.write("vectors " + self.txt_vectors.GetValue() + "\n")
+        f.write("aggression " + self.txt_intensity.GetValue() + "\n")
+        f.write("threads_per_gpu " + self.txt_gputhreads.GetValue() + "\n")
+        f.write("sharethreads 32\n")
+        f.write("lookup_gap 2\n")
+        f.close()
+        
+    def configure_subprocess_reaper(self):
+        """Set up the command line for reaper."""
+        
+        if os.path.exists(STARTUP_PATH + "\\reaper"):
+            if os.path.exists(STARTUP_PATH + "\\reaper-" + self.name):
+                logger.info("Reaper folder for miner already exists, writing config and commencing with mining.")
+                self.write_reaper_configs(STARTUP_PATH + "\\reaper-" + self.name)
+            else:
+                logger.info("Reaper folder for miner missing, adding folder, files, and config.")
+                os.makedirs(STARTUP_PATH + "\\reaper-" + self.name)
+                distutils.dir_util.copy_tree(STARTUP_PATH + "\\reaper", os.getcwd() + "\\reaper-" + self.name)
+                self.write_reaper_configs(STARTUP_PATH + "\\reaper-" + self.name)
+        else:
+            logger.info("Reaper folder with binaries is missing; can not mine!  Add reaper to ./reaper/ folder please.")
+
+        path = STARTUP_PATH + "\\reaper-" + self.name
+
+        # Have to change working directory, windows pain in the ass for reaper - TacoTime
+        os.chdir(path)
+        cmd = path + "\\reaper.exe" # Change this for unix!!!  - TacoTime
+        return cmd, os.path.dirname(path)      
+        
+    def configure_subprocess_stratumproxy(self):
+        """Set up the command line for proxy miner."""
+        path = STARTUP_PATH + "\\stratumproxy\\mining_proxy.exe"
         if path.endswith('.py'):
             path = "python " + path
 
@@ -943,15 +1125,12 @@ class MinerTab(wx.Panel):
         # -d <device appear in pyopencl>
         # -l <log message period in second>
         # -T <disable curses interface and output to console (stdout)>
-        cmd = "%s -u %s -p %s -o http://%s:%s -d %s -l 1 -T %s" % (
+        cmd = "%s -pa scrypt -o %s -p %s %s" % (
             path,
-            self.txt_username.GetValue(),
-            self.txt_pass.GetValue(),
             self.host_without_http_prefix,
             self.txt_port.GetValue(),
-            self.device_index,
             self.txt_flags.GetValue())
-        return cmd, os.path.dirname(self.external_path)
+        return cmd, os.path.dirname(path)
 
     # End backend specific code
     ###########################
@@ -968,6 +1147,7 @@ class MinerTab(wx.Panel):
         # Determine what command line arguments to use
 
         listener_cls = MinerListenerThread
+        
         if not self.is_external_miner:
             conf_func = self.configure_subprocess_poclbm
         elif "rpcminer" in self.external_path:
@@ -977,10 +1157,15 @@ class MinerTab(wx.Panel):
         elif "phoenix" in self.external_path:
             conf_func = self.configure_subprocess_phoenix
             listener_cls = PhoenixListenerThread
-        elif "cgminer" in self.external_path:
+        elif "CGMINER" in self.external_path:
             conf_func = self.configure_subprocess_cgminer
             listener_cls = CgListenerThread
-
+        elif "REAPER" in self.external_path:
+            conf_func = self.configure_subprocess_reaper
+            listener_cls = ReaperListenerThread
+        elif "PROXY" in self.external_path:
+            conf_func = self.configure_subprocess_stratumproxy
+            listener_cls = ProxyListenerThread
         else:
             raise ValueError # TODO: handle unrecognized miner
         cmd, cwd = conf_func()
@@ -993,18 +1178,18 @@ class MinerTab(wx.Panel):
             # for cgminer: 
             # We need only the STDOUT for meaningful messages.
             if conf_func == self.configure_subprocess_cgminer:
-                self.miner = subprocess.Popen(cmd, cwd=cwd,
+                self.miner = subprocess.Popen(cmd,
                                               stdout=subprocess.PIPE,
                                               stderr=None,
                                               universal_newlines=True,
-                                              creationflags=flags,
+                                              creationflags=0x08000000,
                                               shell=(sys.platform != 'win32'))
             else:
-                self.miner = subprocess.Popen(cmd, cwd=cwd,
+                self.miner = subprocess.Popen(cmd,
                                               stdout=subprocess.PIPE,
                                               stderr=subprocess.STDOUT,
                                               universal_newlines=True,
-                                              creationflags=flags,
+                                              creationflags=0x08000000,
                                               shell=(sys.platform != 'win32'))
             
         except OSError:
@@ -1052,9 +1237,38 @@ class MinerTab(wx.Panel):
         """
         self.last_rate = rate
         self.set_status(format_khash(rate), 1)
+        
         if self.is_possible_error:
             self.update_statusbar()
             self.is_possible_error = False
+            
+    def update_shares_reaper(self, quantity, accepted):
+        if self.is_solo:
+            self.solo_blocks_found = quantity
+        elif accepted:
+            self.accepted_shares = quantity
+        else:
+            self.invalid_shares = quantity
+        self.update_last_time(accepted) # BUG: This doesn't work right, but let's ignore it for now - TacoTime
+        self.update_statusbar()
+        
+    def update_attributes_reaper(self, clstring):
+        sharesA = int(non_decimal.sub('', re.search(r"shares: *\d+\|", clstring).group(0)))
+        sharesR = int(non_decimal.sub('', re.search(r"\|\d+,", clstring).group(0)))
+        hashrate = float(non_decimal.sub('', re.search(r"\~.*kH", clstring).group(0)))
+        
+        if self.is_solo:
+            self.solo_blocks_found = sharesA
+        else:
+            self.accepted_shares = sharesA
+        
+        self.invalid_shares = sharesR
+        self.last_rate = hashrate
+        self.set_status(format_khash(hashrate), 1)
+        if self.is_possible_error:
+            self.update_statusbar()
+            self.is_possible_error = False
+        self.update_statusbar()
 
     def update_statusbar(self):
         """Show the shares or equivalent on the statusbar."""
@@ -1111,7 +1325,10 @@ class MinerTab(wx.Panel):
         thing to do is just show it to the user on the status bar.
         """
         self.set_status(msg)
-        self.is_possible_error = True
+        if self.last_rate == -1.0:
+            self.is_possible_error = False
+        else:
+            self.is_possible_error = True
 
     def set_status(self, msg, index=0):
         """Set the current statusbar text, but only if we have focus."""
@@ -1140,13 +1357,27 @@ class MinerTab(wx.Panel):
         self.accepted_shares += 1
         self.update_last_time(True)
         self.update_statusbar()
+        
+    def on_select_gpusettings(self, event):
+        """Update our info in response to a new server choice."""
+        new_gpusettings_name = str(self.gpusettings.GetValue())
+        new_gpusettings = self.get_gpusettings_by_field(new_gpusettings_name, 'name')
+        self.change_gpusettings(new_gpusettings)
 
     def on_select_server(self, event):
         """Update our info in response to a new server choice."""
+        print self.server.GetValue()
         new_server_name = self.server.GetValue()
         new_server = self.get_server_by_field(new_server_name, 'name')
         self.change_server(new_server)
 
+    def get_gpusettings_by_field(self, target_val, field):
+        """Return the first server dict with the specified val, or {}."""
+        for s in self.gpusettings_data:
+            if s.get(field) == target_val:
+                return s
+        return {}        
+        
     def get_server_by_field(self, target_val, field):
         """Return the first server dict with the specified val, or {}."""
         for s in self.servers:
@@ -1167,14 +1398,12 @@ class MinerTab(wx.Panel):
         add_tooltip(self.website, _("Website of the currently selected server. Click to visit."))
         add_tooltip(self.device_listbox, _("Available OpenCL devices on your system."))
         add_tooltip(self.txt_host, _("Host address, without http:// prefix."))
-        add_tooltip(self.txt_port, _("Server port. This is usually 8332."))
+        add_tooltip(self.txt_port, _("Server port. This is usually 8332 for getwork or 3333 for stratum."))
         add_tooltip(self.txt_username, _("The miner's username.\nMay be different than your account username.\nExample: Kiv.GPU"))
         add_tooltip(self.txt_pass, _("The miner's password.\nMay be different than your account password."))
-        add_tooltip(self.txt_flags, _("""Extra flags to pass to the miner.
-For poclbm use -v -w 128 for dedicated mining, append -f 60 for desktop usage.
-For cgminer use -I 8 or -I 9. Without any params for desktop usage."""))
-        for chk in self.affinity_chks:
-            add_tooltip(chk, _("CPU cores used for mining.\nUnchecking some cores can reduce high CPU usage in some systems."))
+        add_tooltip(self.txt_flags, _("Extra flags to pass to the miner."))
+        #for chk in self.affinity_chks:
+        #    add_tooltip(chk, _("CPU cores used for mining.\nUnchecking some cores can reduce high CPU usage in some systems."))
 
     def reset_statistics(self):
         """Reset our share statistics to zero."""
@@ -1184,6 +1413,19 @@ For cgminer use -I 8 or -I 9. Without any params for desktop usage."""))
         self.invalid_shares = 0
         self.invalid_times.clear()
         self.update_statusbar()
+        
+    def change_gpusettings(self, new_gpusettings):
+        self.reset_statistics()
+        if 'thread_concurrency' in new_gpusettings:
+            self.txt_thrcon.SetValue(str(new_gpusettings['thread_concurrency']))
+        if 'worksize' in new_gpusettings:
+            self.txt_worksize.SetValue(str(new_gpusettings['worksize']))
+        if 'vectors' in new_gpusettings:
+            self.txt_vectors.SetValue(str(new_gpusettings['vectors']))
+        if 'gputhreads' in new_gpusettings:
+            self.txt_gputhreads.SetValue(str(new_gpusettings['gputhreads']))
+        if 'intensity' in new_gpusettings:
+            self.txt_intensity.SetValue(str(new_gpusettings['intensity']))
 
     def change_server(self, new_server):
         """Change the server to new_server, updating fields as needed."""
@@ -1516,14 +1758,14 @@ For cgminer use -I 8 or -I 9. Without any params for desktop usage."""))
         Return the lowest row that is available.
         """
         self.frame_sizer = wx.BoxSizer(wx.VERTICAL)
-        self.frame_sizer.Add((20, 10), 0, wx.EXPAND, 0)
-        self.inner_sizer = wx.GridBagSizer(10, 5)
+        self.frame_sizer.Add((20, 10), 0, wx.EXPAND, 0) # Controls top window size
+        self.inner_sizer = wx.GridBagSizer(10, 5) # Controls inner window height, width
         self.button_sizer = wx.BoxSizer(wx.HORIZONTAL)
         row = 0
-        if self.is_external_miner:
-            self.inner_sizer.Add(self.external_lbl, (row, 0), flag=LBL_STYLE)
-            self.inner_sizer.Add(self.txt_external, (row, 1), span=(1, 3), flag=wx.EXPAND)
-            row += 1
+        # if self.is_external_miner:
+            # self.inner_sizer.Add(self.external_lbl, (row, 0), flag=LBL_STYLE)
+            # self.inner_sizer.Add(self.txt_external, (row, 1), span=(1, 3), flag=wx.EXPAND)
+            # row += 1
         return row
 
     def layout_server_and_website(self, row):
@@ -1532,21 +1774,64 @@ For cgminer use -I 8 or -I 9. Without any params for desktop usage."""))
         self.inner_sizer.Add(self.server, (row, 1), flag=wx.EXPAND)
         self.inner_sizer.Add(self.website_lbl, (row, 2), flag=LBL_STYLE)
         self.inner_sizer.Add(self.website, (row, 3), flag=wx.ALIGN_CENTER_VERTICAL)
+        
+    def layout_minertype(self, row):
+        """Display which miner is being used"""
+        if self.external_path == "CGMINER":
+            self.inner_sizer.Add(self.minercgminer_lbl, (row, 0), flag=LBL_STYLE)
+        elif self.external_path == "REAPER":
+            self.inner_sizer.Add(self.minerreaper_lbl, (row, 0), flag=LBL_STYLE)
+        else:
+            self.inner_sizer.Add(self.proxy_lbl, (row, 0), flag=LBL_STYLE)
 
     def layout_host_and_port(self, row):
         """Lay out the host and port widgets in the specified row."""
         self.inner_sizer.Add(self.host_lbl, (row, 0), flag=LBL_STYLE)
         self.inner_sizer.Add(self.txt_host, (row, 1), flag=wx.EXPAND)
         self.inner_sizer.Add(self.port_lbl, (row, 2), flag=LBL_STYLE)
-        self.inner_sizer.Add(self.txt_port, (row, 3), flag=wx.EXPAND)
+        self.inner_sizer.Add(self.txt_port, (row, 3), flag=wx.ALIGN_CENTER_VERTICAL)
 
     def layout_user_and_pass(self, row):
         """Lay out the user and pass widgets in the specified row."""
         self.inner_sizer.Add(self.user_lbl, (row, 0), flag=LBL_STYLE)
         self.inner_sizer.Add(self.txt_username, (row, 1), flag=wx.EXPAND)
         self.inner_sizer.Add(self.pass_lbl, (row, 2), flag=LBL_STYLE)
-        self.inner_sizer.Add(self.txt_pass, (row, 3), flag=wx.EXPAND)
+        self.inner_sizer.Add(self.txt_pass, (row, 3), flag=wx.EXPAND)    
+    
+    def layout_thrcon_worksize(self, row):
+        """
+        Like it sounds, thread concurrency and worksize boxes.
+        """
+        self.inner_sizer.Add(self.thrcon_lbl, (row, 0), flag=LBL_STYLE)
+        self.inner_sizer.Add(self.txt_thrcon, (row, 1), flag=wx.EXPAND)
+        self.inner_sizer.Add(self.worksize_lbl, (row, 2), flag=LBL_STYLE)
+        self.inner_sizer.Add(self.txt_worksize, (row, 3), flag=wx.EXPAND)
 
+    def layout_vectors_intensity(self, row):
+        """
+        Like it sounds, vector and intensity boxes.
+        """
+        self.inner_sizer.Add(self.vectors_lbl, (row, 0), flag=LBL_STYLE)
+        self.inner_sizer.Add(self.txt_vectors, (row, 1), flag=wx.EXPAND)
+        self.inner_sizer.Add(self.intensity_lbl, (row, 2), flag=LBL_STYLE)
+        self.inner_sizer.Add(self.txt_intensity, (row, 3), flag=wx.EXPAND)
+        
+    def layout_gputhreads_gpusettings(self, row):
+        """
+        Like it sounds, vector and intensity boxes.
+        """
+        self.inner_sizer.Add(self.gputhreads_lbl, (row, 0), flag=LBL_STYLE)
+        self.inner_sizer.Add(self.txt_gputhreads, (row, 1), flag=wx.EXPAND)
+        self.inner_sizer.Add(self.gpusettings_lbl, (row, 2), flag=LBL_STYLE)
+        self.inner_sizer.Add(self.gpusettings, (row, 3), flag=wx.EXPAND)
+        
+    def layout_stratum(self, row):
+        """
+        Like it sounds, vector and intensity boxes.
+        """
+        self.inner_sizer.Add(self.stratum_lbl, (row, 0), flag=LBL_STYLE)
+        self.inner_sizer.Add(self.txt_stratum, (row, 1), flag=wx.EXPAND)
+    
     def layout_device_and_flags(self, row):
         """Lay out the device and flags widgets in the specified row.
 
@@ -1561,15 +1846,15 @@ For cgminer use -I 8 or -I 9. Without any params for desktop usage."""))
         self.inner_sizer.Add(self.flags_lbl, (row, col), flag=LBL_STYLE)
         span = (1, 1) if device_visible else (1, 4)
         self.inner_sizer.Add(self.txt_flags, (row, col + 1), span=span, flag=wx.EXPAND)
-
+        
     def layout_affinity(self, row):
         """Lay out the affinity checkboxes in the specified row."""
         self.inner_sizer.Add(self.affinity_lbl, (row, 0))
 
         affinity_sizer = wx.BoxSizer(wx.HORIZONTAL)
-        for chk in self.affinity_chks:
-            affinity_sizer.Add(chk)
-        self.inner_sizer.Add(affinity_sizer, (row, 1))
+        # for chk in self.affinity_chks:
+            # affinity_sizer.Add(chk)
+        # self.inner_sizer.Add(affinity_sizer, (row, 1))
 
     def layout_balance(self, row):
         """Lay out the balance widgets in the specified row."""
@@ -1585,32 +1870,59 @@ For cgminer use -I 8 or -I 9. Without any params for desktop usage."""))
         for btn in [self.start, self.balance_refresh, self.withdraw]:
             self.button_sizer.Add(btn, 0, BTN_STYLE, 5)
 
-        self.set_widgets_visible([self.external_lbl, self.txt_external],
-                                 self.is_external_miner)
+        # self.set_widgets_visible([self.external_lbl, self.txt_external],
+        #                         self.is_external_miner)
         self.SetSizerAndFit(self.frame_sizer)
 
     def layout_default(self):
         """Lay out a default miner with no custom changes."""
+        
         self.user_lbl.SetLabel(STR_USERNAME)
-
         self.set_widgets_visible(self.hidden_widgets, False)
         self.set_widgets_visible([self.balance_lbl,
                                   self.balance_amt,
                                   self.balance_refresh,
-                                  self.withdraw], False)
+                                  self.withdraw,
+                                  self.server,
+                                  self.website,
+                                  self.server_lbl,
+                                  self.website_lbl], False)
         row = self.layout_init()
-        self.layout_server_and_website(row=row)
+        # self.layout_server_and_website(row=row)
+        
         customs = ["other", "solo"]
         is_custom = self.server.GetStringSelection().lower() in customs
         if is_custom:
-            self.layout_host_and_port(row=row + 1)
-        else:
-            self.set_widgets_visible([self.host_lbl, self.txt_host,
-                                      self.port_lbl, self.txt_port], False)
+            # self.layout_host_and_port(row=row + 1)
+            pass
+        # Nope - TT
+        #else:
+        #    self.set_widgets_visible([self.host_lbl, self.txt_host,
+        #                              self.port_lbl, self.txt_port], False)
+        
+        self.set_widgets_visible([self.affinity_lbl], False)
 
-        self.layout_user_and_pass(row=row + 1 + int(is_custom))
-        self.layout_device_and_flags(row=row + 2 + int(is_custom))
-        self.layout_affinity(row=row + 3 + int(is_custom))
+        self.layout_minertype(row=row)
+        self.layout_host_and_port(row=row + 1)
+        self.layout_user_and_pass(row=row + 2 + int(is_custom))
+        self.layout_device_and_flags(row=row + 3 + int(is_custom))
+        self.layout_thrcon_worksize(row=row + 4 + int(is_custom))
+        self.layout_vectors_intensity(row=row + 5 + int(is_custom))
+        self.layout_gputhreads_gpusettings(row=row + 6 + int(is_custom))
+        self.layout_stratum(row=row + 7 + int(is_custom))
+        # self.layout_affinity(row=row + 7 + int(is_custom))
+        
+        if self.external_path == "CGMINER":
+            self.set_widgets_visible([self.minerreaper_lbl, self.proxy_lbl], False)
+        elif self.external_path == "REAPER":
+            self.set_widgets_visible([self.minercgminer_lbl, self.proxy_lbl, self.stratum_lbl, self.txt_stratum, self.flags_lbl, self.txt_flags], False)
+        else:
+            self.set_widgets_visible([self.minercgminer_lbl, self.minerreaper_lbl], False)
+            
+        if self.external_path == "PROXY":
+            self.set_widgets_visible([self.user_lbl, self.pass_lbl, self.device_lbl, self.thrcon_lbl, self.worksize_lbl, self.vectors_lbl, self.intensity_lbl, self.gputhreads_lbl,  self.gpusettings_lbl,  self.stratum_lbl], False)
+            self.set_widgets_visible([self.txt_username, self.txt_pass, self.device_listbox, self.txt_thrcon, self.txt_worksize, self.txt_vectors, self.txt_intensity, self.txt_gputhreads,  self.gpusettings, self.txt_stratum], False) 
+       
         self.layout_finish()
 
     ############################
@@ -1778,21 +2090,27 @@ class GUIMiner(wx.Frame):
         defaults_config_path = os.path.join(get_module_path(), 'defaults.ini')
         with open(defaults_config_path) as f:
             self.defaults = json.load(f)
+            
+        gpusettings_config_path = os.path.join(get_module_path(), 'gpusettings.ini')
+        with open(gpusettings_config_path) as f:
+            data = json.load(f)
+            self.gpusettings_data = data.get('gpusettings')
 
         self.parse_config()
         self.do_show_opencl_warning = self.config_data.get('show_opencl_warning', True)
         self.console_max_lines = self.config_data.get('console_max_lines', 5000)
 
-        ID_NEW_EXTERNAL, ID_NEW_PHOENIX, ID_NEW_CGMINER, ID_NEW_CUDA, ID_NEW_UFASOFT = wx.NewId(), wx.NewId(), wx.NewId(), wx.NewId(), wx.NewId()
+        ID_NEW_EXTERNAL, ID_NEW_PHOENIX, ID_NEW_CGMINER, ID_NEW_REAPER, ID_NEW_PROXY, ID_NEW_UFASOFT = wx.NewId(), wx.NewId(), wx.NewId(), wx.NewId(), wx.NewId(), wx.NewId()
         self.menubar = wx.MenuBar()
         file_menu = wx.Menu()
         new_menu = wx.Menu()
-        new_menu.Append(wx.ID_NEW, _("&New OpenCL miner..."), _("Create a new OpenCL miner (default for ATI cards)"), wx.ITEM_NORMAL)
+        #new_menu.Append(wx.ID_NEW, _("&New OpenCL miner..."), _("Create a new OpenCL miner (default for ATI cards)"), wx.ITEM_NORMAL)
         #new_menu.Append(ID_NEW_PHOENIX, _("New Phoenix miner..."), _("Create a new Phoenix miner (for some ATI cards)"), wx.ITEM_NORMAL)
-        new_menu.Append(ID_NEW_CGMINER, _("New CG miner..."), _("Create a new CGMiner (for some ATI cards)"), wx.ITEM_NORMAL)
-        new_menu.Append(ID_NEW_CUDA, _("New CUDA miner..."), _("Create a new CUDA miner (for NVIDIA cards)"), wx.ITEM_NORMAL)
-        new_menu.Append(ID_NEW_UFASOFT, _("New Ufasoft CPU miner..."), _("Create a new Ufasoft miner (for CPUs)"), wx.ITEM_NORMAL)
-        new_menu.Append(ID_NEW_EXTERNAL, _("New &other miner..."), _("Create a new custom miner (requires external program)"), wx.ITEM_NORMAL)
+        new_menu.Append(ID_NEW_CGMINER, _("New CG miner..."), _("Create a new CGMiner"), wx.ITEM_NORMAL)
+        new_menu.Append(ID_NEW_REAPER, _("New reaper miner..."), _("Create a new reaper miner"), wx.ITEM_NORMAL)
+        new_menu.Append(ID_NEW_PROXY, _("New stratum proxy..."), _("Create a new stratum proxy"), wx.ITEM_NORMAL)
+        #new_menu.Append(ID_NEW_UFASOFT, _("New Ufasoft CPU miner..."), _("Create a new Ufasoft miner (for CPUs)"), wx.ITEM_NORMAL)
+        #new_menu.Append(ID_NEW_EXTERNAL, _("New &other miner..."), _("Create a new custom miner (requires external program)"), wx.ITEM_NORMAL)
         file_menu.AppendMenu(wx.NewId(), _('&New miner'), new_menu)
         file_menu.Append(wx.ID_SAVE, _("&Save settings"), _("Save your settings"), wx.ITEM_NORMAL)
         file_menu.Append(wx.ID_OPEN, _("&Load settings"), _("Load stored settings"), wx.ITEM_NORMAL)
@@ -1826,7 +2144,7 @@ class GUIMiner(wx.Frame):
 
         ID_DONATE_SMALL = wx.NewId()
         donate_menu = wx.Menu()
-        donate_menu.Append(ID_DONATE_SMALL, _("&Donate..."), _("Donate Bitcoins to support GUIMiner development"))
+        donate_menu.Append(ID_DONATE_SMALL, _("&Donate..."), _("Donate Litecoins to support GUIMiner development"))
         self.menubar.Append(donate_menu, _("&Donate"))
 
         help_menu = wx.Menu()
@@ -1870,7 +2188,8 @@ class GUIMiner(wx.Frame):
         #self.Bind(wx.EVT_MENU, self.new_phoenix_profile, id=ID_NEW_PHOENIX)
         self.Bind(wx.EVT_MENU, self.new_cgminer_profile, id=ID_NEW_CGMINER)
         self.Bind(wx.EVT_MENU, self.new_ufasoft_profile, id=ID_NEW_UFASOFT)
-        self.Bind(wx.EVT_MENU, self.new_cuda_profile, id=ID_NEW_CUDA)
+        self.Bind(wx.EVT_MENU, self.new_reaper_profile, id=ID_NEW_REAPER)
+        self.Bind(wx.EVT_MENU, self.new_proxy_profile, id=ID_NEW_PROXY)
         self.Bind(wx.EVT_MENU, self.new_external_profile, id=ID_NEW_EXTERNAL)
         self.Bind(wx.EVT_MENU, self.save_config, id=wx.ID_SAVE)
         self.Bind(wx.EVT_MENU, self.load_config, id=wx.ID_OPEN)
@@ -1904,7 +2223,7 @@ class GUIMiner(wx.Frame):
 
     def set_properties(self):
         self.SetIcons(get_icon_bundle())
-        self.SetTitle(_("GUIMiner - v%s") % __version__)
+        self.SetTitle(_("GUIMiner-scrypt alpha"))
         self.statusbar.SetStatusWidths([-1, 125])
         statusbar_fields = ["", STR_NOT_STARTED]
         for i in range(len(statusbar_fields)):
@@ -1928,7 +2247,7 @@ class GUIMiner(wx.Frame):
     def add_profile(self, data={}):
         """Add a new MinerTab to the list of tabs."""
         panel = MinerTab(self.nb, -1, self.devices, self.servers,
-                             self.defaults, self.statusbar, data)
+                             self.defaults, self.gpusettings_data, self.statusbar, data)
         self.nb.AddPage(panel, panel.name)
         # The newly created profile should have focus.
         self.nb.EnsureVisible(self.nb.GetPageCount() - 1)
@@ -1978,33 +2297,38 @@ class GUIMiner(wx.Frame):
             return
         path = os.path.join(dialog.GetDirectory(), dialog.GetFilename())
         dialog.Destroy()
-        self.name_new_profile(extra_profile_data=dict(external_path=path))
+        self.name_new_profile(extra_profile_data=dict(external_path="CGMINER"))
 
     def new_phoenix_profile(self, event):
         """Create a new miner using the Phoenix OpenCL miner backend."""
         path = os.path.join(get_module_path(), 'phoenix.exe')
-        self.name_new_profile(extra_profile_data=dict(external_path=path))
+        self.name_new_profile(extra_profile_data=dict(external_path="CGMINER"))
 
     def new_cgminer_profile(self, event):
         """Create a new miner using the Cgminer OpenCL miner backend."""
         path = os.path.join(get_module_path(), 'cgminer.exe')
-        self.name_new_profile(extra_profile_data=dict(external_path=path))
+        self.name_new_profile(extra_profile_data=dict(external_path="CGMINER"))
 
     def new_ufasoft_profile(self, event):
         """Create a new miner using the Ufasoft CPU miner backend."""
-        path = os.path.join(get_module_path(), 'miners', 'ufasoft', 'bitcoin-miner.exe')
-        self.name_new_profile(extra_profile_data=dict(external_path=path))
+        # path = os.path.join(get_module_path(), 'miners', 'ufasoft', 'bitcoin-miner.exe')
+        self.name_new_profile(extra_profile_data=dict(external_path="CGMINER"))
 
-    def new_cuda_profile(self, event):
-        """Create a new miner using the CUDA GPU miner backend."""
-        path = os.path.join(get_module_path(), 'miners', 'puddinpop', 'rpcminer-cuda.exe')
-        self.name_new_profile(extra_profile_data=dict(external_path=path))
+    def new_reaper_profile(self, event):
+        """Create a new miner using the REAPER GPU miner backend."""
+        # path = os.path.join(get_module_path(), 'miners', 'puddinpop', 'rpcminer-cuda.exe')
+        self.name_new_profile(extra_profile_data=dict(external_path="REAPER"))
+        
+    def new_proxy_profile(self, event):
+        """Create a stratum proxy backend."""
+        # path = os.path.join(get_module_path(), 'miners', 'puddinpop', 'rpcminer-cuda.exe')
+        self.name_new_profile(extra_profile_data=dict(external_path="PROXY"))
 
     def get_storage_location(self):
         """Get the folder and filename to store our JSON config."""
         if sys.platform == 'win32':
             folder = os.path.join(os.environ['AppData'], 'poclbm')
-            config_filename = os.path.join(folder, 'poclbm.ini')
+            config_filename = os.path.join(folder, 'poclbm_scrypt.ini')
         else: # Assume linux? TODO test
             folder = os.environ['HOME']
             config_filename = os.path.join(folder, '.poclbm')
