@@ -10,12 +10,21 @@ Currently supports:
 Copyright 2011-2012 Chris MacLeod
 This program is released under the GNU GPL. See LICENSE.txt for details.
 """
-import sys, os, subprocess, errno, re, threading, logging, time, httplib, urllib, distutils.dir_util
+import os, sys, subprocess, errno, re, threading, logging, time, httplib, urllib, distutils.dir_util
 print sys.path
 import wx
 import json
 import collections
 import pyopencl
+from _winreg import (
+    CloseKey, OpenKey, QueryValueEx, SetValueEx,
+    HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE,
+    KEY_ALL_ACCESS, KEY_READ, REG_EXPAND_SZ, REG_SZ
+)
+
+"""
+Begin startup processes
+"""
 
 try:
     import win32api, win32con, win32process
@@ -26,11 +35,15 @@ from wx.lib.agw import flatnotebook as fnb
 from wx.lib.agw import hyperlink
 from wx.lib.newevent import NewEvent
 
-__version__ = 'v0.01'
+__version__ = 'v0.02'
 
 STARTUP_PATH = os.getcwd()
 
-def get_module_path():
+"""
+End startup processes
+"""
+
+def get_module_path(): # Redundant with os.getcwd() at opening; not needed?  Tacotime
     """Return the folder containing this script (or its .exe)."""
     module_name = sys.executable if hasattr(sys, 'frozen') else __file__
     abs_path = os.path.abspath(module_name)
@@ -214,7 +227,7 @@ def format_khash(rate):
         return _("%.1f Mhash/s") % (rate / 1000.)
     elif rate == 0:
         return _("Connecting...")
-    elif rate == -1.0:
+    elif rate == -0.0000001:
         return _("Proxy connected")
     else:
         return _("%d khash/s") % rate
@@ -552,7 +565,7 @@ class ProxyListenerThread(MinerListenerThread):
         (r".* REJECTED:.*",
             lambda _: UpdateAcceptedEvent(accepted=False)),
         (r".*LISTENING.*", lambda match:
-            UpdateHashRateEvent(rate = -1.0)),
+            UpdateHashRateEvent(rate = -0.0000001)),
     ]
 
 class MinerTab(wx.Panel):
@@ -632,6 +645,8 @@ class MinerTab(wx.Panel):
         self.txt_stratum = wx.ComboBox(self, -1,
                                   choices=['Yes','No'],
                                   style=wx.CB_READONLY)
+        self.stratuminfo0_lbl = wx.StaticText(self, -1, _("Connect miners to"))
+        self.stratuminfo1_lbl = wx.StaticText(self, -1, _("host: localhost port: 8332"))
         self.balance_lbl = wx.StaticText(self, -1, _("Balance:"))
         self.balance_amt = wx.StaticText(self, -1, "0")
         self.balance_refresh = wx.Button(self, -1, STR_REFRESH_BALANCE)
@@ -643,8 +658,7 @@ class MinerTab(wx.Panel):
         self.labels = [self.minercgminer_lbl, self.minerreaper_lbl, self.proxy_lbl, self.server_lbl, self.website_lbl,
                       self.host_lbl, self.port_lbl,
                       self.user_lbl, self.pass_lbl,
-
-                      self.device_lbl, self.thrcon_lbl, self.vectors_lbl, self.intensity_lbl, self.gputhreads_lbl, self.worksize_lbl, self.stratum_lbl, self.flags_lbl, 
+                      self.device_lbl, self.thrcon_lbl, self.vectors_lbl, self.intensity_lbl, self.gputhreads_lbl, self.worksize_lbl, self.stratum_lbl, self.stratuminfo0_lbl, self.stratuminfo1_lbl, self.flags_lbl, 
                       self.balance_lbl]
         self.txts = [self.txt_host, self.txt_port,
                      self.txt_username, self.txt_pass,
@@ -885,7 +899,7 @@ class MinerTab(wx.Panel):
             text = STR_STOPPED
         elif self.is_possible_error:
             text = _("Connection problems")
-        elif (self.last_rate == -1.0):
+        elif (self.last_rate == -0.0000001):
             text = _("Proxy connected")
         else:
             text = format_khash(self.last_rate)
@@ -1029,6 +1043,7 @@ class MinerTab(wx.Panel):
 
         # Set the path for cgminer, should be ./cgminer/cgminer.exe
         # Not set up for unix, modify this to /cgminer/cgminer for unix
+        os.chdir(STARTUP_PATH)
         path = STARTUP_PATH + "\\cgminer\\cgminer.exe"
         
         #if path.endswith('.py'):
@@ -1043,23 +1058,28 @@ class MinerTab(wx.Panel):
         # -u <username>
         # -p <password>
         # -o <http://server.ip:port>
+        # --gpu-platform <like it sounds>
+        # -w <worksize>
+        # -v <vectors>
         # -d <device appear in pyopencl>
         # -l <log message period in second>
         # -T <disable curses interface and output to console (stdout)>
-        cmd = "%s --scrypt -u %s -p %s -o %s%s:%s -d %s --thread-concurrency %s -w %s -v %s -I %s -g %s -l 5 -T %s" % (
+        # -g <GPU threads>
+        cmd = "%s --scrypt -u %s -p %s -o %s%s:%s --gpu-platform %s -d %s -w %s -v %s -I %s -g %s -l 1 -T %s --thread-concurrency %s" % (
             path,
             self.txt_username.GetValue(),
             self.txt_pass.GetValue(),
             http_header,
             self.host_without_http_prefix,
             self.txt_port.GetValue(),
+            self.platform_index,
             self.device_index,
-            self.txt_thrcon.GetValue(),
             self.txt_worksize.GetValue(),
             self.txt_vectors.GetValue(),
             self.txt_intensity.GetValue(),
             self.txt_gputhreads.GetValue(),
-            self.txt_flags.GetValue())
+            self.txt_flags.GetValue(),
+            self.txt_thrcon.GetValue())
         return cmd, os.path.dirname(path)
 
     def write_reaper_configs(self, reaperdir):
@@ -1092,6 +1112,7 @@ class MinerTab(wx.Panel):
         
     def configure_subprocess_reaper(self):
         """Set up the command line for reaper."""
+        os.chdir(STARTUP_PATH)
         
         if os.path.exists(STARTUP_PATH + "\\reaper"):
             if os.path.exists(STARTUP_PATH + "\\reaper-" + self.name):
@@ -1114,6 +1135,7 @@ class MinerTab(wx.Panel):
         
     def configure_subprocess_stratumproxy(self):
         """Set up the command line for proxy miner."""
+        os.chdir(STARTUP_PATH)
         path = STARTUP_PATH + "\\stratumproxy\\mining_proxy.exe"
         if path.endswith('.py'):
             path = "python " + path
@@ -1178,7 +1200,10 @@ class MinerTab(wx.Panel):
             # for cgminer: 
             # We need only the STDOUT for meaningful messages.
             if conf_func == self.configure_subprocess_cgminer:
+                cgminer_env = os.environ # Create an environment to set below environmental variable in
+                cgminer_env['GPU_MAX_ALLOC_PERCENT'] = "100" # Set this environmental variable so we can use high thread concurrencies in cgminer
                 self.miner = subprocess.Popen(cmd,
+                                              env=cgminer_env,
                                               stdout=subprocess.PIPE,
                                               stderr=None,
                                               universal_newlines=True,
@@ -1325,7 +1350,7 @@ class MinerTab(wx.Panel):
         thing to do is just show it to the user on the status bar.
         """
         self.set_status(msg)
-        if self.last_rate == -1.0:
+        if self.last_rate == -0.0000001:
             self.is_possible_error = False
         else:
             self.is_possible_error = True
@@ -1402,6 +1427,13 @@ class MinerTab(wx.Panel):
         add_tooltip(self.txt_username, _("The miner's username.\nMay be different than your account username.\nExample: Kiv.GPU"))
         add_tooltip(self.txt_pass, _("The miner's password.\nMay be different than your account password."))
         add_tooltip(self.txt_flags, _("Extra flags to pass to the miner."))
+        add_tooltip(self.txt_thrcon, _("Set the memory size for the scrypt kernel to use.\n1 unit = 64 KB"))
+        add_tooltip(self.txt_worksize, _("Set the worksize value.\nDefault: 256"))
+        add_tooltip(self.txt_vectors, _("Set the vectors value.\nDefault: 1"))
+        add_tooltip(self.txt_gputhreads, _("Set the number of default threads to use.\nDefault: 1"))
+        add_tooltip(self.txt_intensity, _("Set the intensity/aggression value.\nHigh intensity: 18-20\nLow intensity: 10-14"))
+        add_tooltip(self.gpusettings, _("Default values for any given AMD video card.\nTry these first if you are new to scrypt mining."))
+        add_tooltip(self.txt_stratum, _("Use the stratum protocol to mine with if your pool supports it.\nReduces the number of stales and network usage."))
         #for chk in self.affinity_chks:
         #    add_tooltip(chk, _("CPU cores used for mining.\nUnchecking some cores can reduce high CPU usage in some systems."))
 
@@ -1792,9 +1824,18 @@ class MinerTab(wx.Panel):
         self.inner_sizer.Add(self.txt_port, (row, 3), flag=wx.ALIGN_CENTER_VERTICAL)
 
     def layout_user_and_pass(self, row):
-        """Lay out the user and pass widgets in the specified row."""
-        self.inner_sizer.Add(self.user_lbl, (row, 0), flag=LBL_STYLE)
-        self.inner_sizer.Add(self.txt_username, (row, 1), flag=wx.EXPAND)
+        """
+        Lay out the user and pass widgets in the specified row.
+        Also used to help out users with stratum proxy.
+        """
+        if (self.external_path == "PROXY"):
+            self.inner_sizer.Add(self.stratuminfo0_lbl, (row, 0), flag=wx.EXPAND)
+        else:
+            self.inner_sizer.Add(self.user_lbl, (row, 0), flag=LBL_STYLE)
+        if  (self.external_path == "PROXY"):
+            self.inner_sizer.Add(self.stratuminfo1_lbl, (row, 1), flag=wx.EXPAND)
+        else:
+            self.inner_sizer.Add(self.txt_username, (row, 1), flag=wx.EXPAND)
         self.inner_sizer.Add(self.pass_lbl, (row, 2), flag=LBL_STYLE)
         self.inner_sizer.Add(self.txt_pass, (row, 3), flag=wx.EXPAND)    
     
@@ -1818,7 +1859,7 @@ class MinerTab(wx.Panel):
         
     def layout_gputhreads_gpusettings(self, row):
         """
-        Like it sounds, vector and intensity boxes.
+        Like it sounds, no. gpu threads and gpu defaults
         """
         self.inner_sizer.Add(self.gputhreads_lbl, (row, 0), flag=LBL_STYLE)
         self.inner_sizer.Add(self.txt_gputhreads, (row, 1), flag=wx.EXPAND)
@@ -1827,7 +1868,7 @@ class MinerTab(wx.Panel):
         
     def layout_stratum(self, row):
         """
-        Like it sounds, vector and intensity boxes.
+        Like it sounds, stratum boxes.
         """
         self.inner_sizer.Add(self.stratum_lbl, (row, 0), flag=LBL_STYLE)
         self.inner_sizer.Add(self.txt_stratum, (row, 1), flag=wx.EXPAND)
@@ -1922,6 +1963,8 @@ class MinerTab(wx.Panel):
         if self.external_path == "PROXY":
             self.set_widgets_visible([self.user_lbl, self.pass_lbl, self.device_lbl, self.thrcon_lbl, self.worksize_lbl, self.vectors_lbl, self.intensity_lbl, self.gputhreads_lbl,  self.gpusettings_lbl,  self.stratum_lbl], False)
             self.set_widgets_visible([self.txt_username, self.txt_pass, self.device_listbox, self.txt_thrcon, self.txt_worksize, self.txt_vectors, self.txt_intensity, self.txt_gputhreads,  self.gpusettings, self.txt_stratum], False) 
+        else:
+            self.set_widgets_visible([self.stratuminfo0_lbl, self.stratuminfo1_lbl], False)
        
         self.layout_finish()
 
