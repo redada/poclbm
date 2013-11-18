@@ -44,7 +44,7 @@ msgstr ""
 "Si has disfrutado con este software, apoya a su desarrollo donando a:\n"
 "%(address)s\n"
 "\n"
-"Incluso una sóla Bitcoin se aprecia y ayuda a motivar\n"
+"Incluso una sola Bitcoin se aprecia y ayuda a motivar\n"
 "a los desarrolladores en el trabajo futuro.\n"
 
 #: guiminer.py:111
@@ -440,7 +440,7 @@ msgstr "Nuevo minero diferente..."
 
 #: guiminer.py:1590
 msgid "&New miner"
-msgstr ""
+msgstr "Nuevo Minero"
 
 #: guiminer.py:1591
 msgid "&Save settings"
@@ -517,15 +517,15 @@ msgstr "&Minería en modo 'solo'"
 
 #: guiminer.py:1611
 msgid "Start &minimized"
-msgstr ""
+msgstr "Comenzar en miniatura"
 
 #: guiminer.py:1611
 msgid "Start the GUI minimized to the tray."
-msgstr ""
+msgstr "Iniciar GUI minimizado en la bandeja."
 
 #: guiminer.py:1613
 msgid "&Options"
-msgstr ""
+msgstr "Opciones"
 
 #: guiminer.py:1617
 msgid "&Change language..."
@@ -537,11 +537,11 @@ msgstr "Idioma"
 
 #: guiminer.py:1622
 msgid "&Donate 99 cents..."
-msgstr ""
+msgstr "&Donar 99 céntimos..."
 
 #: guiminer.py:1622
 msgid "Donate $0.99 USD worth of Bitcoins to support GUIMiner development"
-msgstr ""
+msgstr "Donar el valor de $0.99 USD en Bitcoins en apoyo al desarrollo de GUIMiner"
 
 #: guiminer.py:1623
 msgid "&Donate"
