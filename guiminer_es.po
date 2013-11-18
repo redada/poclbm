@@ -525,7 +525,7 @@ msgstr "Iniciar GUI minimizado en la bandeja."
 
 #: guiminer.py:1613
 msgid "&Options"
-msgstr "Opciones"
+msgstr "&Opciones"
 
 #: guiminer.py:1617
 msgid "&Change language..."
